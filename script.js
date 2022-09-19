@@ -19,10 +19,10 @@ function prepareAccountId(data) {
       .replace("@", "")
       .replace("https://wallet.near.org/send-money/", "")
       .toLowerCase();
-  }
+  };
   if (data.length === 64 && !data.startsWith("ed25519:")) {
     return data;
-  }
+  };
   let publicKey;
   if (data.startsWith("NEAR")) {
     publicKey = decode(data.slice(4)).slice(0, -4);
@@ -37,12 +37,42 @@ const readOption = (reader, f, defaultValue) => {
   return x === 1 ? f() : defaultValue;
 };
 
+// query the NEAR Rpc to get the latest block height
+async function getChainTip() {
+  const statusUrl = "https://rpc.mainnet.near.org/status";
+  const req = await fetch(statusUrl);
+  const data = await req.json();
+  return data.sync_info;
+};
+
+// get the block timestamp, to calculate the correct vesting information, and the epoch height
+async function getBlockInfo(rpcProvider, height) {
+  const res = {};
+  // get the block data
+  const blockData = await rpcProvider.connection.provider.sendJsonRpc("block",{ "block_id": height
+  });
+  res["block_height"] = await blockData.header.height;
+  res["block_hash"] = await blockData.header.hash;
+  res["block_timestamp"] = new Date(await blockData.header.timestamp/1000000);
+  res["block_nanosec"] = await blockData.header.timestamp;
+  // get the epoch data, aka the last block when rewards were distributed
+  const epochBlockInfo = await rpcProvider.connection.provider.sendJsonRpc("block", {
+    "block_id": blockData.header.next_epoch_id
+  });
+  res["epoch_height"] = await epochBlockInfo.header.height;
+  res["epoch_hash"] = await epochBlockInfo.header.hash;
+  res["epoch_timestamp"] = new Date(await epochBlockInfo.header.timestamp/1000000);
+  res["epoch_nanosec"] = await epochBlockInfo.header.timestamp
+  return res;
+};
+
 async function viewLockupState(connection, contractId) {
   const result = await connection.provider.sendJsonRpc("query", {
-    request_type: "view_state",
-    finality: "final",
-    account_id: contractId,
-    prefix_base64: "U1RBVEU=",
+    "request_type": "view_state",
+    "block_id": blockHeight,
+    "account_id": contractId,
+    "prefix_base64": "U1RBVEU="
+    //, "finality": "final"
   });
   let value = Buffer.from(result.values[0].value, "base64");
   let reader = new nearAPI.utils.serialize.BinaryReader(value);
@@ -107,8 +137,13 @@ async function viewLockupState(connection, contractId) {
   };
 }
 
+// Api key to query the Figment DataHub archival node 
+const figmentDhKey = process.env['api_key']
+
+// Connect to the archival RPC endpoint
 const options = {
-  nodeUrl: "https://rpc.mainnet.near.org",
+  // nodeUrl: "https://rpc.mainnet.near.org",
+  nodeUrl: "https://near-mainnet--rpc--archive.datahub.figment.io/apikey/"+figmentDhKey,
   networkId: "mainnet",
   deps: {},
 };
@@ -116,6 +151,7 @@ const options = {
 async function lookupLockup(near, accountId) {
   const lockupAccountId = accountToLockup("lockup.near", accountId);
   try {
+    /* Old query method:
     const lockupAccount = await near.account(lockupAccountId);
     const lockupAccountBalance = await lockupAccount.viewFunction(
       lockupAccountId,
@@ -123,11 +159,36 @@ async function lookupLockup(near, accountId) {
       {}
     );
     const lockupState = await viewLockupState(near.connection, lockupAccountId);
+    */
+    const lockupAccount = await near.connection.provider.sendJsonRpc("query", {
+        "request_type": "call_function",
+        "block_id": blockHeight,
+        "account_id": lockupAccountId,
+        "method_name": "get_balance",
+        "args_base64": ""
+        //, "finality": "final"
+      });
+    
+    const lockupAccountBalance = new Buffer.from(lockupAccount.result).slice(1,-1).toString();
+
+    const lockupCode = await near.connection.provider.sendJsonRpc("query", {
+      "request_type": "view_code",
+      "block_id": blockHeight,
+      "account_id": lockupAccountId
+      //, "finality": "final"
+    });
+    
+    const lockupState = await viewLockupState(near.connection, lockupAccountId);
+    
     // More details: https://github.com/near/core-contracts/pull/136
     lockupState.hasBrokenTimestamp = [
       "3kVY9qcVRoW3B5498SMX6R3rtSLiCdmBzKs7zcnzDJ7Q",
       "DiC9bKCqUHqoYqUXovAnqugiuntHWnM3cAc7KrgaHTu",
-    ].includes((await lockupAccount.state()).code_hash);
+      ].includes(lockupCode.hash);
+    
+    /* to be used if the old query method is reinstated:
+      ].includes((await lockupAccount.state()).code_hash);
+    */
     return { lockupAccountId, lockupAccountBalance, lockupState };
   } catch (error) {
     console.log(error);
@@ -181,6 +242,7 @@ async function fetchPools(masterAccount) {
   return poolsWithFee;
 }
 
+// Obsolete function: not yet updated with the blockId query method, so the result will always return the latest block state - as it is default with nearApiJs
 async function updateStaking(near, accountId, lookupAccountId) {
   const template = document.getElementById("pool-template").innerHTML;
   document.getElementById("loader").classList.add("active");
@@ -244,9 +306,15 @@ const saturatingSub = (a, b) => {
 };
 
 // https://github.com/near/core-contracts/blob/master/lockup/src/getters.rs#L64
-async function getLockedTokenAmount(lockupState) {
+async function getLockedTokenAmount(lockupState, blockHeightQuery) {
   const phase2Time = new BN("1602614338293769340");
+
+  /* Previous lock calculation, which assumed "now" for the result:
+  
   let now = new BN((new Date().getTime() * 1000000).toString());
+  
+  */
+  let now = new BN(blockHeightQuery.toString());
   if (now.lte(phase2Time)) {
     return saturatingSub(
       lockupState.lockupAmount,
@@ -321,12 +389,22 @@ function formatVestingInfo(info) {
 }
 
 async function lookup() {
+  blockHeight =  parseInt(document.getElementById("blockHeight").value);
+  if (!(blockHeight)) {
+    syncInfo = await getChainTip();
+    // relaxed the blockHeight query to 10 blocks back from the tip, we are looking at an archive after all =)
+    blockHeight = (await syncInfo.latest_block_height) -10;
+    document.getElementById("blockHeight").value = blockHeight;
+  };
   const inputAccountId = document.querySelector("#account").value;
   window.location.hash = inputAccountId;
   const near = await nearAPI.connect(options);
+
   let accountId = prepareAccountId(inputAccountId);
 
   let lockupAccountId = "",
+    epochHeight = "",
+    blockDate = "",
     lockupAccountBalance = 0,
     ownerAccountBalance = 0,
     lockupReleaseStartTimestamp = new BN(0),
@@ -335,15 +413,38 @@ async function lookup() {
   const template = document.getElementById("template").innerHTML;
   document.getElementById("pools").innerHTML = "";
   try {
+    // logs, just because
+    console.log("trying "+accountId);
+    console.log("at block height "+blockHeight);
+
+    // cleaning up the output from previous queries and enabling the loader
+    document.getElementById("output").innerHTML = '';
+    document.getElementById("loader").classList.add("active");
+    
+    // retrieving the block and epoch information
+    const blockInfo = await getBlockInfo(near, blockHeight);
+    epochHeight = blockInfo.epoch_height.toString();
+    blockDate = blockInfo.block_timestamp.toString();
+    
+    /* old query:
+    
     let account = await near.account(accountId);
     let state = await account.state();
+    
+    */
+    
+    let state = await near.connection.provider.sendJsonRpc("query", {
+      "request_type": "view_account",
+      "block_id": blockHeight,
+      "account_id": accountId
+      //, "finality": "final"
+    });
     ownerAccountBalance = state.amount;
-    ({ lockupAccountId, lockupAccountBalance, lockupState } =
-      await lookupLockup(near, accountId));
-
+    ({ lockupAccountId, lockupAccountBalance, lockupState } = await lookupLockup(near, accountId));
+    
     if (lockupState) {
       lockupReleaseStartTimestamp = getStartLockupTimestamp(lockupState);
-      lockedAmount = await getLockedTokenAmount(lockupState);
+      lockedAmount = await getLockedTokenAmount(lockupState, blockInfo.block_nanosec);
       lockupState.releaseDuration = lockupState.releaseDuration
         .div(new BN("1000000000"))
         .divn(60)
@@ -354,7 +455,11 @@ async function lookup() {
         lockupState.vestingInformation
       );
     }
+
+    document.getElementById("loader").classList.remove("active");
     document.getElementById("output").innerHTML = Mustache.render(template, {
+      epochHeight,
+      blockDate,
       accountId,
       lockupAccountId,
       ownerAccountBalance: nearAPI.utils.format.formatNearAmount(
@@ -380,18 +485,25 @@ async function lookup() {
       ),
       lockupState,
     });
-
+    /* disabled pool fetching to save resources, this is irrelevant for the sake of this tool:
+    
     await updateStaking(near, accountId, lockupAccountId);
+    
+    */
   } catch (error) {
     document.getElementById("error").style.display = "block";
     document.getElementById("loader").classList.remove("active");
   }
-}
+};
 
 window.nearAPI = nearAPI;
 window.lookup = lookup;
 
 window.onload = () => {
+  (async() => {
+    window.syncInfo = await getChainTip();
+  })();
+  
   if (window.location.hash) {
     document.querySelector("#account").value = window.location.hash.slice(1);
     lookup();
